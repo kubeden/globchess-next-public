@@ -1,0 +1,438 @@
+// components/ChessGame.js
+
+import { useState, useEffect, useCallback, useRef } from 'react';
+import { useSession } from 'next-auth/react';
+import { Chess } from 'chess.js';
+import { Chessboard } from 'react-chessboard';
+import { db, auth } from '../lib/firebaseConfig';
+import { doc, getDoc, getDocs, updateDoc, onSnapshot, addDoc, collection, query, orderBy, serverTimestamp, deleteDoc, limit, runTransaction, writeBatch } from 'firebase/firestore';
+
+export default function ChessGame({ onMoveAttempt, isLoggedIn }) {
+    const { data: session } = useSession();
+    const [game, setGame] = useState(new Chess());
+    const [pendingMove, setPendingMove] = useState(null);
+    const [boardOrientation, setBoardOrientation] = useState('white');
+    const [userTokens, setUserTokens] = useState(0);
+    const [lastMove, setLastMove] = useState(null);
+    const [isBoardLocked, setIsBoardLocked] = useState(false);
+    const [lockUntil, setLockUntil] = useState(null);
+    const [moveHistory, setMoveHistory] = useState([]);
+    const [currentMoveIndex, setCurrentMoveIndex] = useState(-1);
+    const [errorMessage, setErrorMessage] = useState('');
+    const isCompletingGameRef = useRef(false);
+
+    // Dynamic button classes based on the pending move state
+    const makeMoveButtonClass = pendingMove
+        ? "bg-green-500 hover:bg-green-600"
+        : "bg-neutral-800 hover:bg-neutral-900";
+
+    const resetMoveButtonClass = pendingMove
+        ? "bg-red-500 hover:bg-red-600"
+        : "bg-neutral-800 hover:bg-neutral-900";
+
+    useEffect(() => {
+        const gameRef = doc(db, "games", "currentGame");
+        const unsubscribeGame = onSnapshot(gameRef, (docSnapshot) => {
+            if (docSnapshot.exists()) {
+                const data = docSnapshot.data();
+                const newGame = new Chess(data.fen);
+                setGame(newGame);
+                setBoardOrientation(newGame.turn() === 'w' ? 'white' : 'black');
+                setLastMove(data.lastMove || null);
+                setLockUntil(data.lockUntil || null);
+                setIsBoardLocked(data.lockUntil ? data.lockUntil > Date.now() : false);
+
+                if (isGameOver(newGame) && !isCompletingGameRef.current) {
+                    handleGameCompletion(newGame, data.lastMove);
+                }
+            } else {
+                initializeNewGame();
+            }
+        });
+
+        if (session) {
+            const userRef = doc(db, "users", session.user.id);
+            const unsubscribeUser = onSnapshot(userRef, (userDoc) => {
+                if (userDoc.exists()) {
+                    setUserTokens(userDoc.data().tokens);
+                }
+            });
+
+            const movesQuery = query(collection(db, "moves"), orderBy("moveTimestamp", "asc"));
+            const unsubscribeMoves = onSnapshot(movesQuery, (snapshot) => {
+                const moves = snapshot.docs.map(doc => doc.data());
+                setMoveHistory(moves);
+                setCurrentMoveIndex(moves.length - 1);
+            });
+
+            return () => {
+                unsubscribeGame();
+                unsubscribeUser();
+                unsubscribeMoves();
+            };
+        }
+
+        return () => unsubscribeGame();
+    }, [session]);
+
+    const initializeNewGame = async () => {
+        const newGame = new Chess();
+        try {
+            await updateDoc(doc(db, "games", "currentGame"), {
+                fen: newGame.fen(),
+                lastMove: null,
+                lockUntil: null
+            });
+        } catch (error) {
+            console.error("Error initializing new game:", error);
+            // setErrorMessage('Failed to start a new game. Please try refreshing the page.');
+        }
+    };
+    
+
+    const onDrop = useCallback((sourceSquare, targetSquare) => {
+        if (!isLoggedIn) {
+            onMoveAttempt();
+            return false;
+        }
+
+        if (isBoardLocked) return false;
+
+        const move = {
+            from: sourceSquare,
+            to: targetSquare,
+            promotion: 'q' // Always promote to queen for simplicity
+        };
+
+        try {
+            const gameCopy = new Chess(game.fen());
+            const result = gameCopy.move(move);
+
+            if (result === null) {
+                // setErrorMessage('Invalid move. Please try again.');
+                return false;
+            }
+
+            setPendingMove({ ...move, playerHandle: session.user.name });
+            setGame(gameCopy);
+            return true;
+        } catch (error) {
+            // console.error("Error in onDrop:", error);
+            // setErrorMessage('An error occurred. Please try again.');
+            return false;
+        }
+    }, [game, isLoggedIn, isBoardLocked, onMoveAttempt, session]);
+
+    async function makeMove() {
+        if (!isLoggedIn) {
+            onMoveAttempt();
+            return;
+        }
+
+        if (!pendingMove || userTokens < 1) return;
+
+        try {
+            await runTransaction(db, async (transaction) => {
+                const gameRef = doc(db, "games", "currentGame");
+                const gameDoc = await transaction.get(gameRef);
+                
+                if (!gameDoc.exists()) {
+                    throw new Error("Game document not found");
+                }
+
+                const currentGameState = new Chess(gameDoc.data().fen);
+                
+                const result = currentGameState.move({
+                    from: pendingMove.from,
+                    to: pendingMove.to,
+                    promotion: pendingMove.promotion
+                });
+
+                if (result === null) {
+                    throw new Error("Invalid move");
+                }
+
+                const lockDuration = 100;
+                const lockUntil = Date.now() + lockDuration;
+
+                const moveData = {
+                    move: `${pendingMove.from}-${pendingMove.to}`,
+                    playerHandle: pendingMove.playerHandle,
+                    moveTimestamp: serverTimestamp()
+                };
+
+                const newMoveRef = doc(collection(db, "moves"));
+                transaction.set(newMoveRef, moveData);
+
+                transaction.update(gameRef, {
+                    fen: currentGameState.fen(),
+                    lastMove: {
+                        from: pendingMove.from,
+                        to: pendingMove.to,
+                        promotion: pendingMove.promotion,
+                        playerHandle: pendingMove.playerHandle
+                    },
+                    lockUntil: lockUntil
+                });
+
+                const userRef = doc(db, "users", session.user.id);
+                transaction.update(userRef, {
+                    tokens: userTokens - 1
+                });
+
+                // if (isGameOver(currentGameState)) {
+                //     await handleGameCompletion(currentGameState, pendingMove, transaction);
+                // }
+            });
+
+            setPendingMove(null);
+            setIsBoardLocked(true);
+            setLockUntil(Date.now() + 100);
+            setTimeout(() => setIsBoardLocked(false), 100);
+
+        } catch (error) {
+            // console.error("Error making move:", error);
+            // setErrorMessage('Failed to make move. Please try again.');
+            const currentGameState = new Chess(game.fen());
+            setGame(currentGameState);
+        }
+    }
+
+    async function resetMove() {
+        setPendingMove(null);
+    
+        try {
+            const gameRef = doc(db, "games", "currentGame");
+            const docSnap = await getDoc(gameRef);
+    
+            if (docSnap.exists()) {
+                const newGame = new Chess(docSnap.data().fen);
+                setGame(newGame);
+            } else {
+                console.error("No such document in Firestore!");
+                // setErrorMessage('Game data not found. Please try again.');
+            }
+        } catch (error) {
+            console.error("Error fetching game data:", error);
+            // setErrorMessage('An error occurred while resetting the move. Please try again.');
+        }
+    }
+
+    function isGameOver(chess) {
+        return chess.isCheckmate() || chess.isDraw() || chess.isStalemate() || chess.isThreefoldRepetition() || chess.isInsufficientMaterial();
+    }
+
+    async function handleGameCompletion(finalGameState, lastMove) {
+        isCompletingGameRef.current = true;
+        try {
+            await runTransaction(db, async (transaction) => {
+                const movesSnapshot = await getDocs(query(collection(db, "moves"), orderBy("moveTimestamp", "asc")));
+                let movesToSave = movesSnapshot.docs.map(doc => {
+                    const data = doc.data();
+                    return {
+                        move: data.move,
+                        playerHandle: data.playerHandle,
+                        moveTimestamp: data.moveTimestamp.toMillis() // Convert Timestamp to milliseconds
+                    };
+                });
+
+                // Add the last move to the moves array for the finished game
+                // movesToSave.push({
+                //     move: `${lastMove.from}-${lastMove.to}`,
+                //     playerHandle: lastMove.playerHandle,
+                //     moveTimestamp: Date.now() // Use current timestamp for the last move
+                // });
+
+                const finishedGame = {
+                    fen: finalGameState.fen(),
+                    moves: movesToSave,
+                    endedAt: Date.now(),
+                    lastMoveBy: lastMove.playerHandle,
+                    result: getGameResult(finalGameState),
+                    status: 'completed'
+                };
+
+                // Save the finished game
+                const newGameRef = await addDoc(collection(db, "games"), finishedGame);
+                await updateDoc(newGameRef, { gameId: newGameRef.id });
+
+                // Delete all moves including the last one
+                movesSnapshot.docs.forEach((doc) => {
+                    transaction.delete(doc.ref);
+                });
+
+                // Start a new game with an empty moves collection
+                const newGame = new Chess();
+                transaction.set(doc(db, "games", "currentGame"), {
+                    fen: newGame.fen(),
+                    lastMove: null,
+                    lockUntil: null
+                });
+
+                // Explicitly delete the 'moves' collection
+                const movesCollectionRef = collection(db, "moves");
+                const allMovesSnapshot = await getDocs(movesCollectionRef);
+                allMovesSnapshot.docs.forEach((doc) => {
+                    transaction.delete(doc.ref);
+                });
+            });
+
+            // Reset local state
+            setMoveHistory([]);
+            setCurrentMoveIndex(-1);
+            setLastMove(null);
+
+        } catch (error) {
+            console.error("Error handling game completion:", error);
+            throw error;
+        } finally {
+            isCompletingGameRef.current = false;
+        }
+    }
+
+    function getGameResult(chess) {
+        if (chess.isCheckmate()) return chess.turn() === 'w' ? 'Black wins' : 'White wins';
+        if (chess.isDraw()) return 'Draw';
+        if (chess.isStalemate()) return 'Stalemate';
+        if (chess.isThreefoldRepetition()) return 'Draw by repetition';
+        if (chess.isInsufficientMaterial()) return 'Draw by insufficient material';
+        return 'Unknown';
+    }
+
+    function processMove(move) {
+        if (typeof move === 'string') {
+            const [from, to] = move.split('-');
+            return { from, to, promotion: 'q' };
+        } else if (typeof move === 'object' && move.from && move.to) {
+            return { ...move, promotion: move.promotion || 'q' };
+        }
+        console.error("Invalid move format:", move);
+        throw new Error("Invalid move format");
+    }
+
+    function goToPreviousMove() {
+        if (currentMoveIndex > 0) {
+            const newIndex = currentMoveIndex - 1;
+            const newGame = new Chess();
+            try {
+                for (let i = 0; i <= newIndex; i++) {
+                    const moveData = processMove(moveHistory[i].move);
+                    newGame.move(moveData);
+                }
+                setGame(newGame);
+                setCurrentMoveIndex(newIndex);
+                setLastMove(moveHistory[newIndex]);
+            } catch (error) {
+                console.error("Error in goToPreviousMove:", error);
+                // setErrorMessage('Unable to show previous move. Please try again.');
+            }
+        }
+    }
+
+    function goToNextMove() {
+        if (currentMoveIndex < moveHistory.length - 1) {
+            const newIndex = currentMoveIndex + 1;
+            const newGame = new Chess();
+            try {
+                for (let i = 0; i <= newIndex; i++) {
+                    const moveData = processMove(moveHistory[i].move);
+                    newGame.move(moveData);
+                }
+                setGame(newGame);
+                setCurrentMoveIndex(newIndex);
+                setLastMove(moveHistory[newIndex]);
+            } catch (error) {
+                console.error("Error in goToNextMove:", error);
+                // setErrorMessage('Unable to show next move. Please try again.');
+            }
+        }
+    }
+
+    // Highlight last move
+    const customSquareStyles = {};
+    if (lastMove) {
+        customSquareStyles[lastMove.from] = { backgroundColor: '#a59681' };
+        customSquareStyles[lastMove.to] = { backgroundColor: '#a59681' };
+    }
+
+    return (
+        <div className="flex flex-col items-center w-full max-w-xl xl:max-w-xl relative">
+            <div className="w-full">
+                <div className="rounded-md flex items-center justify-center border-4 border-gray-500">
+                    <div className="absolute top-0 -left-24 flex flex-row justify-between items-center mb-2">
+                        <div className="flex items-center space-x-2 bg-neutral-800 p-2 rounded h-full border-2 border-gray-700">
+                            <img src="/assets/img/token.png" alt="Token" className="w-6 h-6" />
+                            <span className="text-white font-bold">{userTokens}</span>
+                        </div>
+                    </div>
+                    <Chessboard 
+                    position={game.fen()} 
+                    onPieceDrop={onDrop}
+                    boardOrientation={boardOrientation}
+                    customSquareStyles={customSquareStyles}
+                    animationDuration={200}
+                    />
+                </div>
+            </div>
+            
+            <div className="w-full mt-4">
+                {errorMessage && (
+                    <div className="bg-red-500 text-white p-2 rounded mb-4">
+                        {errorMessage}
+                    </div>
+                )}
+                {isBoardLocked && (
+                    <div className="bg-yellow-500 text-black p-2 rounded mb-4">
+                        Board is locked. Please wait.
+                    </div>
+                )}
+                <div className="grid grid-cols-2 gap-4 mb-4">
+                    <button 
+                        onClick={isLoggedIn ? makeMove : onMoveAttempt} 
+                        disabled={isLoggedIn && (!pendingMove || userTokens < 1 || isBoardLocked)}
+                        className={`${makeMoveButtonClass} px-6 py-4 text-white font-bold rounded-xl transition ${isLoggedIn ? 'disabled:bg-neutral-600 disabled:cursor-not-allowed' : ''}`}
+                    >
+                        Make Move
+                    </button>
+                    <button 
+                        onClick={resetMove} 
+                        disabled={!isLoggedIn || !pendingMove}
+                        className={`${resetMoveButtonClass} px-6 py-4 text-white font-bold rounded-xl transition disabled:bg-neutral-600 disabled:cursor-not-allowed`}
+                    >
+                        Reset Move
+                    </button>
+                </div>
+                <div className="flex justify-between gap-x-4">
+                    <button 
+                        onClick={goToPreviousMove} 
+                        disabled={currentMoveIndex <= 0}
+                        className="bg-neutral-800 px-4 py-2 text-neutral-100 font-bold rounded-md transition hover:bg-blue-600 disabled:bg-neutral-600 disabled:cursor-not-allowed"
+                    >
+                        Previous Move
+                    </button>
+                    <div className="flex flex-col items-center bg-neutral-800 p-2 rounded w-full">
+                        {lastMove && (
+                            <>
+                            <div className="text-white text-sm">
+                                Last Move: <span className="font-bold">
+                                {typeof lastMove.move === 'string' ? lastMove.move : `${lastMove.from}-${lastMove.to}`}
+                                </span>
+                            </div>
+                            <div className="text-white text-sm">
+                                By: <span className="font-bold">{lastMove.playerHandle}</span>
+                            </div>
+                            </>
+                        )}
+                    </div>
+                    <button 
+                        onClick={goToNextMove} 
+                        disabled={currentMoveIndex >= moveHistory.length - 1}
+                        className="bg-neutral-800 px-4 py-2 text-neutral-100 font-bold rounded-md transition hover:bg-blue-600 disabled:bg-neutral-600 disabled:cursor-not-allowed"
+                    >
+                        Next Move
+                    </button>
+                </div>
+            </div>
+        </div>
+    );
+}
